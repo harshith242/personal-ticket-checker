@@ -1,0 +1,41 @@
+name: Odyssey ticket watcher
+
+on:
+  schedule:
+    # Every 15 min, offset off the hour (UTC) to dodge peak-load delays.
+    # GitHub doesn't guarantee timing — runs can still be 10–30 min late.
+    - cron: "3,18,33,48 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually to test
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright requests
+          python -m playwright install --with-deps chromium
+
+      - name: Check for tickets
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          EXTRA_CHAT_IDS: ${{ secrets.EXTRA_CHAT_IDS }}
+        run: python check_once.py
+
+      - name: Save page snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot
+          path: |
+            hit.png
+            hit.html
+          if-no-files-found: ignore
