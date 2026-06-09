@@ -4,7 +4,7 @@ on:
   schedule:
     # Every 15 min, offset off the hour (UTC) to dodge peak-load delays.
     # GitHub doesn't guarantee timing — runs can still be 10–30 min late.
-    - cron: "3,18,33,48 * * * *"
+    - cron: "2,18,33,51 * * * *"
   workflow_dispatch: {}   # lets you trigger a run manually to test
 
 jobs:
