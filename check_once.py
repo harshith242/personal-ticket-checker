@@ -20,7 +20,7 @@ import requests
 from playwright.sync_api import sync_playwright
 
 # ------------------------------ Config ------------------------------
-TARGET_DATE    = "2026-07-25"
+TARGET_DATE    = "2026-07-19"
 VENUE_SLUG     = "pvr-palazzo-the-nexus-vijaya-mall-chennai-in-chennai-CD1022274"
 TARGET_URL     = f"https://www.district.in/movies/{VENUE_SLUG}?fromdate={TARGET_DATE}"
 MOVIE_KEYWORD  = "odyssey"   # matched case-insensitively against the page text
