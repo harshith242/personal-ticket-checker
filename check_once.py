@@ -84,14 +84,34 @@ def extract_showtimes(body):
     return ", ".join(dict.fromkeys(times)) or "(open the page to see times)"
 
 
+def load_page(page):
+    for attempt in range(3):
+        try:
+            page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=45000)
+            return True
+        except Exception as e:
+            log(f"goto attempt {attempt + 1} failed: {e}")
+            page.wait_for_timeout(3000)
+    return False
+
+
 def main():
     fmt_label = FORMAT_KEYWORD.upper() or "any format"
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-http2", "--disable-blink-features=AutomationControlled"]
+        )
         ctx = browser.new_context(user_agent=USER_AGENT,
-                                  viewport={"width": 1280, "height": 900})
+                                  viewport={"width": 1280, "height": 900},
+                                  locale="en-IN",
+                                  extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"})
         page = ctx.new_page()
-        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=45000)
+
+        if not load_page(page):
+            log("Page never loaded; skipping this run.")
+            browser.close()
+            return
 
         # wait up to ~10s for a decisive state to render
         for _ in range(20):
