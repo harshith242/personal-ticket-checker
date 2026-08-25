@@ -1,30 +1,51 @@
 #!/usr/bin/env python3
 """
-Odyssey IMAX watcher — SINGLE-RUN version for GitHub Actions.
+Toxic ticket watcher — SINGLE-RUN version for GitHub Actions.
 
-Checks the District venue page ONCE. If 'The Odyssey' is listed in IMAX for the
-target date, it sends a Telegram alert with a screenshot and exits. No loop, no
-heartbeat, no stop-command — GitHub's scheduler handles the "run again later".
+Checks the BookMyShow venue page ONCE for a target date. BookMyShow serves the
+showtimes as an embedded `window.__INITIAL_STATE__` blob, so this reads the
+structured JSON instead of scraping text — the movie list is React-virtualized,
+so only the visible cards exist in the DOM and text scraping misses the rest.
+
+Two facts come out of one page load:
+  * ShowDatesArray[].isDisabled  — whether the target date has opened at all.
+    BookMyShow redirects an unopened date back to today, so the requested URL
+    alone is not proof of what got served.
+  * Event[] -> ChildEvents[] -> ShowTimes[]  — the actual shows, scoped per
+    movie, so a format keyword can't match a different film on the same page.
 
 Config comes from environment variables (set as GitHub repository Secrets):
   BOT_TOKEN        your bot token
   CHAT_ID          your chat id
   EXTRA_CHAT_IDS   optional, comma-separated extra recipients
+  TARGET_DATE      optional, overrides the date below (YYYYMMDD)
+  MOVIE_KEYWORD / FORMAT_KEYWORD / LANG_KEYWORD   optional filter overrides
 """
 
+import json
 import os
-import re
-from datetime import datetime
+import sys
+from datetime import datetime, timedelta, timezone
 
 import requests
 from playwright.sync_api import sync_playwright
 
 # ------------------------------ Config ------------------------------
-TARGET_DATE    = "2026-07-25"
-VENUE_SLUG     = "pvr-palazzo-the-nexus-vijaya-mall-chennai-in-chennai-CD1022274"
-TARGET_URL     = f"https://www.district.in/movies/{VENUE_SLUG}?fromdate={TARGET_DATE}"
-MOVIE_KEYWORD  = "odyssey"   # matched case-insensitively against the page text
-FORMAT_KEYWORD = "imax"      # set to "" to alert on ANY Odyssey show, not just IMAX
+TARGET_DATE = os.getenv("TARGET_DATE") or "20260826"   # YYYYMMDD
+
+VENUE_CODE  = "ALUC"
+VENUE_PATH  = "cinemas/HYD/allu-cinemas-kokapet/buytickets"
+TARGET_URL  = f"https://in.bookmyshow.com/{VENUE_PATH}/{VENUE_CODE}/{TARGET_DATE}"
+
+# All three match case-insensitively; "" disables that filter. Env vars let a
+# manual workflow_dispatch run test against a date/movie that already exists.
+MOVIE_KEYWORD  = (os.getenv("MOVIE_KEYWORD")  or "toxic").lower()
+FORMAT_KEYWORD = (os.getenv("FORMAT_KEYWORD") or "").lower()   # e.g. "imax", "dolby"
+LANG_KEYWORD   = (os.getenv("LANG_KEYWORD")   or "").lower()   # e.g. "telugu"
+
+# Alert once the date opens even if the movie isn't listed on it yet. The date
+# opening is the rare event; the movie usually appears in the same wave.
+ALERT_ON_DATE_OPEN = True
 
 USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -37,26 +58,30 @@ CHAT_IDS = [c.strip() for c in
 
 SHOT_PATH = "hit.png"
 HTML_PATH = "hit.html"
+JSON_PATH = "state.json"
+IST = timezone(timedelta(hours=5, minutes=30))
 # --------------------------------------------------------------------
 
 
 def log(msg):
-    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+    print(f"[{datetime.now(IST):%H:%M:%S}] {msg}", flush=True)
 
 
 def send_telegram(msg):
     if not (BOT_TOKEN and CHAT_IDS):
+        log("No Telegram credentials; skipping notification.")
         return
     for cid in CHAT_IDS:
         try:
             requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                         params={"chat_id": cid, "text": msg}, timeout=10)
+                         params={"chat_id": cid, "text": msg[:4000]}, timeout=10)
         except Exception as e:
             log(f"Telegram to {cid} failed: {e}")
 
 
 def send_telegram_photo(path, caption=""):
     if not (BOT_TOKEN and CHAT_IDS):
+        log("No Telegram credentials; skipping notification.")
         return
     for cid in CHAT_IDS:
         try:
@@ -66,81 +91,60 @@ def send_telegram_photo(path, caption=""):
                               files={"photo": f}, timeout=30)
         except Exception as e:
             log(f"Telegram photo to {cid} failed: {e}")
+            send_telegram(caption)
 
 
-def classify(body):
-    low = body.lower()
-    if "no shows playing" in low:
-        return "NO_SHOWS"
-    if MOVIE_KEYWORD in low and (not FORMAT_KEYWORD or FORMAT_KEYWORD in low):
-        return "HIT"
-    if MOVIE_KEYWORD in low:
-        return "MOVIE_NO_FORMAT"
-    return "UNKNOWN"
+def pretty_date(code):
+    try:
+        return datetime.strptime(code, "%Y%m%d").strftime("%a %d %b %Y")
+    except ValueError:
+        return code
 
 
-def extract_showtimes(body):
-    times = re.findall(r"\b\d{1,2}:\d{2}\s*[AP]M\b", body)
-    return ", ".join(dict.fromkeys(times)) or "(open the page to see times)"
+# -------------------------- Page interaction ------------------------
+EXTRACT_JS = """
+() => {
+  const S = window.__INITIAL_STATE__;
+  if (!S) return null;
+  const q = (S.venueShowtimesFunctionalApi || {}).queries || {};
+  const key = Object.keys(q).find(k => k.startsWith('getShowtimesByVenue'));
+  if (!key) return null;
+  const data = q[key].data || {};
+  return {
+    servedDate: key.split('-').pop(),
+    showDates: data.ShowDatesArray || [],
+    events: (data.showDetailsTransformed || {}).Event || []
+  };
+}
+"""
 
 
-def load_page(page):
+def load_state(page):
+    """Navigate and pull the embedded state. Returns the dict, or None."""
     for attempt in range(3):
         try:
             page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=45000)
-            return True
         except Exception as e:
             log(f"goto attempt {attempt + 1} failed: {e}")
             page.wait_for_timeout(3000)
-    return False
-
-
-def main():
-    fmt_label = FORMAT_KEYWORD.upper() or "any format"
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-http2", "--disable-blink-features=AutomationControlled"]
-        )
-        ctx = browser.new_context(user_agent=USER_AGENT,
-                                  viewport={"width": 1280, "height": 900},
-                                  locale="en-IN",
-                                  extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"})
-        page = ctx.new_page()
-
-        if not load_page(page):
-            log("Page never loaded; skipping this run.")
-            browser.close()
-            return
-
-        # wait up to ~10s for a decisive state to render
+            continue
+        # The blob is inlined by SSR, but the redirect to today re-renders it.
         for _ in range(20):
-            low = page.inner_text("body").lower()
-            if "no shows playing" in low or MOVIE_KEYWORD in low:
-                break
+            state = page.evaluate(EXTRACT_JS)
+            if state:
+                return state
             page.wait_for_timeout(500)
-
-        body = page.inner_text("body")
-        state = classify(body)
-        log(f"State: {state}")
-
-        if state == "HIT":
-            page.screenshot(path=SHOT_PATH, full_page=True)
-            with open(HTML_PATH, "w", encoding="utf-8") as f:
-                f.write(page.content())
-            times = extract_showtimes(body)
-            msg = (f"\U0001F3AC ODYSSEY ({fmt_label}) is LISTED for {TARGET_DATE} "
-                   f"at PVR Palazzo!\nShowtimes: {times}\n{TARGET_URL}\n"
-                   f"(Disable the GitHub Action once you've booked to stop these.)")
-            send_telegram_photo(SHOT_PATH, caption=msg)
-            log("Alert sent.")
-        else:
-            # Save a snapshot anyway so we can confirm what the runner actually saw
-            with open(HTML_PATH, "w", encoding="utf-8") as f:
-                f.write(page.content())
-
-        browser.close()
+        log(f"attempt {attempt + 1}: page loaded but __INITIAL_STATE__ never appeared")
+    return None
 
 
-if __name__ == "__main__":
-    main()
+def date_is_open(show_dates, target):
+    """True/False if the date strip mentions the target, None if it doesn't."""
+    for d in show_dates:
+        if d.get("DateCode") == target:
+            return not d.get("isDisabled", True)
+    return None
+
+
+def matching_shows(events):
+    """Shows for MOVIE_KEYWORD, scoped per movie so filters can't cross-match."""
