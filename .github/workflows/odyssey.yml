@@ -1,11 +1,21 @@
-name: Odyssey ticket watcher
+name: Toxic ticket watcher
 
 on:
   schedule:
     # Every 15 min, offset off the hour (UTC) to dodge peak-load delays.
     # GitHub doesn't guarantee timing — runs can still be 10–30 min late.
-    - cron: "2,18,33,51 * * * *"
-  workflow_dispatch: {}   # lets you trigger a run manually to test
+    - cron: "*/5 * * * *"
+  workflow_dispatch:      # lets you trigger a run manually to test
+    inputs:
+      target_date:
+        description: "Date to check (YYYYMMDD). Blank uses the script default."
+        required: false
+      movie_keyword:
+        description: "Movie title substring. Blank uses 'toxic'."
+        required: false
+      format_keyword:
+        description: "Format substring. Blank uses 'dolby'."
+        required: false
 
 jobs:
   check:
@@ -28,6 +38,9 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           EXTRA_CHAT_IDS: ${{ secrets.EXTRA_CHAT_IDS }}
+          TARGET_DATE: ${{ inputs.target_date }}
+          MOVIE_KEYWORD: ${{ inputs.movie_keyword }}
+          FORMAT_KEYWORD: ${{ inputs.format_keyword }}
         run: python check_once.py
 
       - name: Save page snapshot
@@ -38,4 +51,5 @@ jobs:
           path: |
             hit.png
             hit.html
+            state.json
           if-no-files-found: ignore
