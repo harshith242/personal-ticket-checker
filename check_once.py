@@ -40,11 +40,11 @@ TARGET_URL  = f"https://in.bookmyshow.com/{VENUE_PATH}/{VENUE_CODE}/{TARGET_DATE
 # All three match case-insensitively; "" disables that filter. Env vars let a
 # manual workflow_dispatch run test against a date/movie that already exists.
 MOVIE_KEYWORD  = (os.getenv("MOVIE_KEYWORD")  or "toxic").lower()
-FORMAT_KEYWORD = (os.getenv("FORMAT_KEYWORD") or "").lower()   # e.g. "imax", "dolby"
+FORMAT_KEYWORD = (os.getenv("FORMAT_KEYWORD") or "dolby").lower()
 LANG_KEYWORD   = (os.getenv("LANG_KEYWORD")   or "").lower()   # e.g. "telugu"
 
-# Alert once the date opens even if the movie isn't listed on it yet. The date
-# opening is the rare event; the movie usually appears in the same wave.
+# Alert once the date opens even if no matching show is listed on it yet. The
+# date opening is the rare event; the shows usually appear in the same wave.
 ALERT_ON_DATE_OPEN = True
 
 USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -146,5 +146,151 @@ def date_is_open(show_dates, target):
     return None
 
 
-def matching_shows(events):
+def matching_shows(events, format_keyword=None):
     """Shows for MOVIE_KEYWORD, scoped per movie so filters can't cross-match."""
+    fmt = FORMAT_KEYWORD if format_keyword is None else format_keyword
+    hits = []
+    for event in events:
+        title = event.get("EventTitle", "")
+        if MOVIE_KEYWORD not in title.lower():
+            continue
+        for child in event.get("ChildEvents", []):
+            dimension = child.get("EventDimension", "")
+            language = child.get("EventLanguage", "")
+            name = child.get("EventName", title)
+            if LANG_KEYWORD and LANG_KEYWORD not in language.lower():
+                continue
+            for show in child.get("ShowTimes", []):
+                attributes = show.get("Attributes", "")
+                blob = f"{name} {dimension} {attributes}".lower()
+                if fmt and fmt not in blob:
+                    continue
+                hits.append({
+                    "name": name,
+                    "language": language,
+                    "dimension": dimension,
+                    "time": show.get("ShowTime", "?"),
+                    "attributes": attributes,
+                    "screen": show.get("ScreenName", ""),
+                    "price": f"{show.get('MinPrice', '?')}-{show.get('MaxPrice', '?')}",
+                })
+    return hits
+
+
+def format_shows(hits):
+    lines = []
+    for h in hits:
+        bits = [h["time"], f"{h['dimension']} {h['language']}".strip()]
+        if h["attributes"]:
+            bits.append(h["attributes"])
+        if h["screen"]:
+            bits.append(h["screen"])
+        bits.append(f"Rs {h['price']}")
+        lines.append("  - " + " | ".join(b for b in bits if b))
+    return "\n".join(lines)
+
+
+def scroll_through(page):
+    """Force the virtualized list to render everything before screenshotting."""
+    try:
+        for _ in range(12):
+            page.mouse.wheel(0, 900)
+            page.wait_for_timeout(250)
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(500)
+    except Exception as e:
+        log(f"scroll pass failed (screenshot may be partial): {e}")
+
+
+# --------------------------------- Main -----------------------------
+def main():
+    today = datetime.now(IST).strftime("%Y%m%d")
+    if TARGET_DATE < today:
+        log(f"TARGET_DATE {TARGET_DATE} is in the past (today {today}). Nothing to watch.")
+        send_telegram(f"Toxic watcher is misconfigured: TARGET_DATE {TARGET_DATE} "
+                      f"is already past (today {today}). Update it or disable the workflow.")
+        sys.exit(1)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-http2", "--disable-blink-features=AutomationControlled"]
+        )
+        ctx = browser.new_context(user_agent=USER_AGENT,
+                                  viewport={"width": 1280, "height": 900},
+                                  locale="en-IN",
+                                  extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"})
+        page = ctx.new_page()
+
+        state = load_state(page)
+
+        if state is None:
+            # Page never loaded, or BookMyShow changed how it ships showtimes.
+            # Either way the watcher is blind, so make the run go red and say so.
+            try:
+                with open(HTML_PATH, "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                page.screenshot(path=SHOT_PATH, full_page=True)
+            except Exception:
+                pass
+            browser.close()
+            log("Could not read showtimes state.")
+            send_telegram("Toxic watcher could not read BookMyShow's showtimes data "
+                          "(blocked, or the page structure changed). It is not "
+                          "watching anything right now — check the Action logs.")
+            sys.exit(1)
+
+        with open(JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=1)
+
+        served = state["servedDate"]
+        opened = date_is_open(state["showDates"], TARGET_DATE)
+        hits = matching_shows(state["events"]) if served == TARGET_DATE else []
+
+        log(f"requested={TARGET_DATE} served={served} "
+            f"date_open={opened} matching_shows={len(hits)}")
+
+        if served != TARGET_DATE or opened is False:
+            # Redirected back to today, or the date strip still flags it disabled.
+            log("Target date not open yet.")
+            browser.close()
+            return
+
+        if opened is None:
+            log(f"Target date {TARGET_DATE} is no longer on the date strip. "
+                f"Treating the served page as authoritative.")
+
+        movie_label = MOVIE_KEYWORD.upper()
+        fmt_label = FORMAT_KEYWORD.upper() or "any format"
+        header = f"{pretty_date(TARGET_DATE)} at ALLU Cinemas Kokapet"
+
+        if hits:
+            msg = (f"\U0001F3AC {movie_label} ({fmt_label}) is LISTED for {header}!\n"
+                   f"{format_shows(hits)}\n{TARGET_URL}\n"
+                   f"(Disable the GitHub Action once you've booked to stop these.)")
+        elif ALERT_ON_DATE_OPEN:
+            other = matching_shows(state["events"], "")
+            if other:
+                msg = (f"\U0001F4C5 Bookings OPENED for {header}. {movie_label} is "
+                       f"listed, but not in {fmt_label} yet:\n{format_shows(other)}\n"
+                       f"{TARGET_URL}")
+            else:
+                titles = ", ".join(e.get("EventTitle", "?") for e in state["events"]) or "none"
+                msg = (f"\U0001F4C5 Bookings OPENED for {header}, but {movie_label} "
+                       f"is not listed at all.\nNow showing: {titles}\n{TARGET_URL}")
+        else:
+            log("Date open, no matching show, alert suppressed.")
+            browser.close()
+            return
+
+        scroll_through(page)
+        page.screenshot(path=SHOT_PATH, full_page=True)
+        with open(HTML_PATH, "w", encoding="utf-8") as f:
+            f.write(page.content())
+        send_telegram_photo(SHOT_PATH, caption=msg)
+        log("Alert sent.")
+        browser.close()
+
+
+if __name__ == "__main__":
+    main()
