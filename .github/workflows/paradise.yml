@@ -50,7 +50,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright requests
+          pip install playwright requests python-dotenv
           if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
             python -m playwright install-deps chromium
           else
