@@ -1,0 +1,78 @@
+name: Paradise ticket watcher
+
+on:
+  # Primary trigger: cron-job.org POSTs to the dispatches API on a real clock.
+  workflow_dispatch:
+    inputs:
+      ignore_format:
+        description: "Alert on ANY matching show (test mode)"
+        type: boolean
+        default: false
+      target_dates:
+        description: "Override dates, comma-separated YYYYMMDD"
+        default: ""
+      movie_keyword:
+        description: "Override movie keyword (e.g. avengers)"
+        default: ""
+      lang_keyword:
+        description: "Override language filter; type 'any' to disable it"
+        default: ""
+  # Backup only — GitHub's scheduler is unreliable, which is why we dispatch.
+  # GitHub also throttles sub-15-minute crons, so this stays at 15.
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+
+# A run takes ~4-6 min (four browser launches). At a 5-minute cadence, runs
+# WILL overlap, so queue them instead of piling on. Never cancel-in-progress:
+# a cancelled run could be the one that found the tickets.
+concurrency:
+  group: paradise-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Cache the browser so most runs skip the ~60-90s Chromium download.
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Install dependencies
+        run: |
+          pip install playwright requests
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
+            python -m playwright install-deps chromium
+          else
+            python -m playwright install --with-deps chromium
+          fi
+
+      - name: Check for tickets
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          IGNORE_FORMAT: ${{ inputs.ignore_format && '1' || '' }}
+          TARGET_DATES: ${{ inputs.target_dates }}
+          MOVIE_KEYWORD: ${{ inputs.movie_keyword }}
+          # 'any' clears the Telugu filter; blank keeps the script default.
+          LANG_KEYWORD: ${{ inputs.lang_keyword == 'any' && ' ' || inputs.lang_keyword }}
+        run: python paradise_check.py
+
+      - name: Save snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshots-${{ github.run_id }}-${{ github.run_attempt }}
+          path: snapshots/
+          if-no-files-found: ignore
+          retention-days: 7
