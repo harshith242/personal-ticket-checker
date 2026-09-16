@@ -47,9 +47,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ------------------------------ Config ------------------------------
-MOVIE_KEYWORD = (os.getenv("MOVIE_KEYWORD") or "avengers").lower()
+MOVIE_KEYWORD = (os.getenv("MOVIE_KEYWORD") or "paradise").lower()
 LANG_KEYWORD  = (os.getenv("LANG_KEYWORD") if os.getenv("LANG_KEYWORD") is not None
-                 else "english").lower()
+                 else "telugu").lower()
 
 TARGET_DATES = [d.strip() for d in
                 (os.getenv("TARGET_DATES") or "20260923,20260926").split(",")
