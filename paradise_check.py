@@ -87,6 +87,17 @@ ALERT_ON_WRONG_FORMAT = True    # ping if Paradise appears but not in your forma
 HOME_URL = "https://in.bookmyshow.com/explore/home/hyderabad"
 IMPERSONATE = "chrome124"
 
+# The film's own BMS identity. The movie-level buytickets URL is the detection
+# target: it returns 200 while the film is still locked, and grows a
+# showtimeWidgets block the moment that date becomes bookable anywhere in HYD.
+EVENT_CODE = os.getenv("EVENT_CODE") or "ET00436621"
+MOVIE_SLUG = os.getenv("MOVIE_SLUG") or "the-paradise-hyderabad"
+
+# Repeated because iOS gives Telegram no true critical alert; one message is
+# easy to sleep through.
+ALERT_REPEATS = 3
+ALERT_GAP_SECONDS = 4
+
 # Retrying fast into a bot-layer block does not help; the one recovery seen in
 # the logs came from a slower attempt. Budget keeps the run under 3 minutes.
 ATTEMPTS_PER_REQUEST = 3
@@ -120,6 +131,12 @@ def venue_base_url(venue):
 
 def venue_date_url(venue, date_code):
     return f"{venue_base_url(venue)}/{date_code}"
+
+
+def movie_date_url(date_code):
+    """Movie-level showtimes for one date, across every venue in Hyderabad."""
+    return (f"https://in.bookmyshow.com/buytickets/{MOVIE_SLUG}"
+            f"/movie-hyd-{EVENT_CODE}-MT/{date_code}")
 
 
 def pretty_date(code):
@@ -176,12 +193,6 @@ def extract_state(html):
             "events": (data.get("showDetailsTransformed") or {}).get("Event") or [],
         }
     return None
-
-
-def open_dates(state):
-    """Date codes the venue is actually selling, as a set."""
-    return {d.get("DateCode") for d in state["showDates"]
-            if not d.get("isDisabled", True)}
 
 
 def find_shows(events, format_keywords):
@@ -272,81 +283,164 @@ def save(name, text):
         pass
 
 
-# ---------------------------- One venue -----------------------------
-def check_date(session, venue, date_code, deadline):
-    """Fetch one date's showtimes and alert if wanted. Assumes date is open."""
-    url = venue_date_url(venue, date_code)
-    tag = f"{venue['code']}-{date_code}"
-    fmt_label = "/".join(f.upper() for f in venue["formats"])
+# --------------------------- Detection ------------------------------
+def extract_dynamic(html):
+    """
+    The movie-level buytickets payload for one date. Returns the inner data
+    dict, or None if the page carried no such query at all (which means the
+    page is not what we think it is, not that the date is closed).
+    """
+    m = STATE_RE.search(html)
+    if not m:
+        return None
+    try:
+        root, _ = json.JSONDecoder().raw_decode(html[m.end():])
+    except ValueError:
+        return None
 
-    html = fetch(session, url, deadline, f"{tag} showtimes")
+    for slice_value in root.values():
+        if not isinstance(slice_value, dict):
+            continue
+        queries = slice_value.get("queries")
+        if not isinstance(queries, dict):
+            continue
+        key = next((k for k in queries
+                    if "fetchprimarydynamic" in k.lower()), None)
+        if not key:
+            continue
+        return ((queries.get(key) or {}).get("data") or {}).get("data") or {}
+    return None
+
+
+def bookable_venues(payload):
+    """
+    Venues selling this film on this date, keyed by venue code. An empty dict
+    means the date is not bookable yet: showtimeWidgets only appears once BMS
+    opens the date.
+    """
+    venues = {}
+    for widget in payload.get("showtimeWidgets") or []:
+        if widget.get("type") != "groupList":
+            continue
+        for group in widget.get("data") or []:
+            for venue in group.get("data") or []:
+                extra = venue.get("additionalData") or {}
+                code = extra.get("venueCode")
+                if not code:
+                    continue
+                times = []
+                for section in venue.get("showtimesSections") or []:
+                    for show in section.get("showtimes") or []:
+                        when = ((show.get("additionalData") or {}).get("showTime")
+                                or show.get("title"))
+                        if when:
+                            times.append(when)
+                venues[code] = {"name": extra.get("venueName") or code,
+                                "times": times}
+    return venues
+
+
+def alert(msg):
+    """iOS gives Telegram no critical alert, so repeat rather than rely on one."""
+    for i in range(ALERT_REPEATS):
+        send_telegram(msg)
+        if i < ALERT_REPEATS - 1:
+            time.sleep(ALERT_GAP_SECONDS)
+
+
+def confirm_format(session, venue, date_code, deadline):
+    """
+    Screen format lives only on the venue page, never in the movie payload.
+    Returns (matching, any_format) or None if the venue page could not be read.
+    """
+    html = fetch(session, venue_date_url(venue, date_code), deadline,
+                 f"{venue['code']}-{date_code} formats")
     if html is None:
-        return "blind"
+        return None
     state = extract_state(html)
     if state is None:
-        save(f"blind-{tag}.html", html)
+        return None
+    save(f"state-{venue['code']}-{date_code}.json", json.dumps(state, indent=1))
+    fmt_keys = None if IGNORE_FORMAT else venue["formats"]
+    return find_shows(state["events"], fmt_keys), find_shows(state["events"], None)
+
+
+# ---------------------------- One date ------------------------------
+def check_date(session, date_code, deadline):
+    """
+    Stage 1: is this date bookable at all? Stage 2, only if so: which screen.
+    Returns 'hit', 'partial', 'none' or 'blind'.
+    """
+    pretty = pretty_date(date_code)
+    log(f"{pretty} | {movie_date_url(date_code)}")
+
+    html = fetch(session, movie_date_url(date_code), deadline, f"{date_code} movie page")
+    if html is None:
         return "blind"
 
-    save(f"state-{tag}.json", json.dumps(state, indent=1))
+    payload = extract_dynamic(html)
+    if payload is None:
+        save(f"blind-movie-{date_code}.html", html)
+        log(f"  {date_code}: no showtimes query on page")
+        return "blind"
 
-    # BMS redirects an unopened date to today, so the URL proves nothing.
-    if state["servedDate"] != date_code:
-        log(f"  {tag}: served {state['servedDate']} instead — not open")
+    # The URL slug is cosmetic — BMS serves off EVENT_CODE alone — so a stale
+    # EVENT_CODE returns 200 for an unrelated page that would read as "not
+    # bookable" forever. The header title is server-derived and empty in that
+    # case, unlike the slug, which the page echoes straight back.
+    title = (((payload.get("header") or {}).get("title") or {}).get("text") or "")
+    if MOVIE_KEYWORD not in title.lower():
+        save(f"blind-movie-{date_code}.html", html)
+        log(f"  {date_code}: page titled {title!r}, expected {MOVIE_KEYWORD!r} "
+            f"(EVENT_CODE {EVENT_CODE} stale?)")
+        return "blind"
+
+    venues = bookable_venues(payload)
+    if not venues:
+        log(f"  {date_code}: not bookable yet")
         return "none"
 
-    fmt_keys = None if IGNORE_FORMAT else venue["formats"]
-    hits = find_shows(state["events"], fmt_keys)
-    any_fmt = find_shows(state["events"], None)
-    log(f"  {tag}: matching={len(hits)} any-format={len(any_fmt)}")
+    log(f"  {date_code}: BOOKABLE at {len(venues)} venues")
+    save(f"bookable-{date_code}.json", json.dumps(venues, indent=1))
 
-    header = f"{venue['name']} — {pretty_date(date_code)}"
-    if hits:
-        msg = (f"\U0001F3AC THE PARADISE ({fmt_label}) is LIVE!\n{header}\n"
-               f"{format_shows(hits)}\n{url}\n"
-               f"(Disable the cron job once you've booked.)")
-        result = "hit"
-    elif any_fmt and ALERT_ON_WRONG_FORMAT:
-        msg = (f"⚠️ The Paradise is listed at {header}, but NOT "
-               f"in {fmt_label} yet:\n{format_shows(any_fmt)}\n{url}")
-        result = "partial"
-    else:
-        log(f"  {tag}: not listed yet")
-        return "none"
+    wanted = {v["code"] for v in VENUES}
+    lines, links, result = [], [], "partial"
 
-    save(f"hit-{tag}.html", html)
-    send_telegram(msg)
+    for venue in VENUES:
+        info = venues.get(venue["code"])
+        if not info:
+            continue
+        fmt_label = "/".join(f.upper() for f in venue["formats"])
+        links.append(venue_date_url(venue, date_code))
+        confirmed = confirm_format(session, venue, date_code, deadline)
+        if confirmed is None:
+            shown = ", ".join(info["times"][:8]) or "times not listed"
+            lines.append(f"{info['name']}: {shown}\n  (format unconfirmed)")
+            continue
+        hits, any_fmt = confirmed
+        if hits:
+            lines.append(f"{info['name']} — {fmt_label}:\n{format_shows(hits)}")
+            result = "hit"
+        elif any_fmt:
+            lines.append(f"{info['name']} — listed but NOT {fmt_label}:\n"
+                         f"{format_shows(any_fmt)}")
+        else:
+            shown = ", ".join(info["times"][:8]) or "times not listed"
+            lines.append(f"{info['name']}: {shown}\n  (Paradise not on venue page yet)")
+
+    others = [i["name"] for c, i in venues.items() if c not in wanted]
+    if not lines:
+        lines.append("Not at your two venues yet.")
+        links.append(movie_date_url(date_code))
+    if others:
+        lines.append(f"Also showing at {len(others)} other venues.")
+
+    body = "\n".join(lines)
+    alert(f"\U0001F3AC {MOVIE_KEYWORD.upper()} — {pretty} — BOOKING OPEN\n{body}\n"
+          + "\n".join(links)
+          + "\n(Disable the cron job once you've booked.)")
     log(f"  ALERT SENT ({result})")
     return result
-
-
-def check_venue(session, venue, dates, deadline):
-    """
-    One request for the venue's date list; only dates that actually exist cost
-    a second request. Returns one result per target date.
-    """
-    fmt_label = "/".join(f.upper() for f in venue["formats"])
-    log(f"{venue['name']} | need {fmt_label} | {', '.join(pretty_date(d) for d in dates)}")
-
-    html = fetch(session, venue_base_url(venue), deadline, f"{venue['code']} date list")
-    if html is None:
-        return ["blind"] * len(dates)
-    state = extract_state(html)
-    if state is None:
-        save(f"blind-{venue['code']}-datelist.html", html)
-        log(f"  {venue['code']}: served a page with no state")
-        return ["blind"] * len(dates)
-
-    available = open_dates(state)
-    log(f"  {venue['code']} selling: {', '.join(sorted(available)) or 'nothing'}")
-
-    results = []
-    for date_code in dates:
-        if date_code not in available:
-            log(f"  {venue['code']}-{date_code}: date not listed yet")
-            results.append("none")
-            continue
-        results.append(check_date(session, venue, date_code, deadline))
-    return results
 
 
 # --------------------------------- Main -----------------------------
@@ -362,16 +456,16 @@ def main():
                       "Update TARGET_DATES or disable the job.")
         sys.exit(1)
 
-    log(f"Watching {MOVIE_KEYWORD!r} "
+    log(f"Watching {EVENT_CODE} {MOVIE_KEYWORD!r} "
         f"({'any format' if IGNORE_FORMAT else 'per-venue formats'}, "
         f"lang={LANG_KEYWORD or 'any'}) on {', '.join(live_dates)}")
 
     session = new_session(deadline)
 
     results = []
-    for i, venue in enumerate(VENUES):
-        results.extend(check_venue(session, venue, live_dates, deadline))
-        if i < len(VENUES) - 1:
+    for i, date_code in enumerate(live_dates):
+        results.append(check_date(session, date_code, deadline))
+        if i < len(live_dates) - 1:
             time.sleep(random.uniform(*GAP_BETWEEN_VENUES))
 
     elapsed = time.monotonic() - started
