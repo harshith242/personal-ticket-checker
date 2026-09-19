@@ -5,7 +5,7 @@ The Paradise watcher — SINGLE-RUN version for GitHub Actions.
 Checks BOTH venues on BOTH dates:
     Allu Cinemas Kokapet (ALUC)  -> screen/format must mention DOLBY
     Prasads Multiplex    (PRHN)  -> screen/format must mention PCX or BARCO
-    Dates: 23 Sep 2026 (premieres) and 26 Sep 2026
+    Dates: 23 Sep 2026 (premieres) and 24 Sep 2026
     Language: Telugu only
 
 IMPORTANT — why this uses curl_cffi and not a browser:
@@ -52,7 +52,7 @@ LANG_KEYWORD  = (os.getenv("LANG_KEYWORD") if os.getenv("LANG_KEYWORD") is not N
                  else "telugu").lower().strip()
 
 TARGET_DATES = [d.strip() for d in
-                (os.getenv("TARGET_DATES") or "20260923,20260926").split(",")
+                (os.getenv("TARGET_DATES") or "20260923,20260924").split(",")
                 if d.strip()]
 
 IGNORE_FORMAT = os.getenv("IGNORE_FORMAT") == "1"
