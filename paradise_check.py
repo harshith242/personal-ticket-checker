@@ -291,6 +291,7 @@ def check_target(venue, date_code):
 def main():
     today = datetime.now(IST).strftime("%Y%m%d")
     live_dates = [d for d in TARGET_DATES if d >= today]
+    log(live_dates)
     if not live_dates:
         log(f"All target dates {TARGET_DATES} are past (today {today}).")
         send_telegram("Paradise watcher: all target dates are in the past. "
