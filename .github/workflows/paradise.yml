@@ -22,9 +22,9 @@ on:
   schedule:
     - cron: "7,22,37,52 * * * *"
 
-# A run takes ~4-6 min (four browser launches). At a 5-minute cadence, runs
-# WILL overlap, so queue them instead of piling on. Never cancel-in-progress:
-# a cancelled run could be the one that found the tickets.
+# A run takes ~15s (four plain HTTP fetches, no browser). Overlap is unlikely
+# even at a 5-minute cadence, but queue rather than pile on. Never
+# cancel-in-progress: a cancelled run could be the one that found the tickets.
 concurrency:
   group: paradise-watcher
   cancel-in-progress: false
@@ -32,7 +32,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -40,22 +40,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Cache the browser so most runs skip the ~60-90s Chromium download.
-      - name: Cache Playwright browsers
-        id: pw-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}
-
       - name: Install dependencies
-        run: |
-          pip install playwright requests python-dotenv
-          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
-            python -m playwright install-deps chromium
-          else
-            python -m playwright install --with-deps chromium
-          fi
+        run: pip install -r requirements.txt
 
       - name: Check for tickets
         env:
