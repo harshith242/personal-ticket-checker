@@ -5,19 +5,19 @@ The Paradise watcher — SINGLE-RUN version for GitHub Actions.
 Checks BOTH venues on BOTH dates:
     Allu Cinemas Kokapet (ALUC)  -> screen/format must mention DOLBY
     Prasads Multiplex    (PRHN)  -> screen/format must mention PCX or BARCO
-    Dates: 23 Sep 2026 (premieres) and 24 Sep 2026 (release)
+    Dates: 23 Sep 2026 (premieres) and 26 Sep 2026
     Language: Telugu only
 
-IMPORTANT — why each target gets its own browser:
-Cloudflare 403s the Prasads page on ANY navigation after the first one in a
-browser session. Testing showed the target page succeeds as the first
-navigation (headless or headed), and fails as the second regardless of stealth
-patches, warmed cookies, or real Chrome. So every venue/date runs in a fresh
-browser with exactly one navigation, and retries relaunch rather than reload.
+IMPORTANT — why this uses curl_cffi and not a browser:
+Cloudflare 403s ("Attention Required!") any client whose TLS/HTTP2 fingerprint
+does not match a real Chrome. Playwright's headless Chromium fails this, and so
+does plain requests/curl. curl_cffi with impersonate="chrome124" presents a
+genuine Chrome TLS fingerprint and is served 200.
 
-Reads BookMyShow's embedded `window.__INITIAL_STATE__` rather than scraping
-text, because the movie list is React-virtualized: only visible cards exist in
-the DOM, so text scraping silently misses films further down the page.
+No browser is needed at all: BookMyShow server-renders the whole showtimes
+payload into `window.__INITIAL_STATE__` inline in the HTML, so the data is in
+the raw response body. This also means no React virtualization problem — the
+blob contains every film, not just the visible cards.
 
 The trigger is The Paradise appearing in the required format — NOT the date
 merely opening, since these dates are days away and already open for other
@@ -26,7 +26,6 @@ films.
 Environment variables (set as GitHub repository Secrets):
   BOT_TOKEN        your bot token
   CHAT_ID          your chat id
-  EXTRA_CHAT_IDS   optional, comma-separated extra recipients
   MOVIE_KEYWORD    optional override (default "paradise")
   LANG_KEYWORD     optional override (default "telugu"; "" = any language)
   TARGET_DATES     optional override, comma-separated YYYYMMDD
@@ -36,12 +35,13 @@ Environment variables (set as GitHub repository Secrets):
 import json
 import os
 import random
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 
 import requests
-from playwright.sync_api import sync_playwright
+from curl_cffi import requests as curl_requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -49,7 +49,7 @@ load_dotenv()
 # ------------------------------ Config ------------------------------
 MOVIE_KEYWORD = (os.getenv("MOVIE_KEYWORD") or "paradise").lower()
 LANG_KEYWORD  = (os.getenv("LANG_KEYWORD") if os.getenv("LANG_KEYWORD") is not None
-                 else "telugu").lower()
+                 else "telugu").lower().strip()
 
 TARGET_DATES = [d.strip() for d in
                 (os.getenv("TARGET_DATES") or "20260923,20260926").split(",")
@@ -75,28 +75,15 @@ VENUES = [
 ALERT_ON_WRONG_FORMAT = True    # ping if Paradise appears but not in your format
 
 ATTEMPTS_PER_TARGET = 3
-GAP_BETWEEN_TARGETS = (6, 12)   # random seconds; avoid a burst of identical hits
+GAP_BETWEEN_TARGETS = (3, 7)    # random seconds; avoid a burst of identical hits
 
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/124.0.0.0 Safari/537.36")
-
-LAUNCH_ARGS = ["--disable-http2", "--disable-blink-features=AutomationControlled"]
+# Rotated across retries; all are real Chrome fingerprints curl_cffi ships.
+IMPERSONATE = ["chrome124", "chrome131", "chrome120"]
 
 HEADERS = {
     "Accept-Language": "en-IN,en;q=0.9",
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"macOS"',
     "Upgrade-Insecure-Requests": "1",
 }
-
-STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-IN','en']});
-window.chrome = window.chrome || {runtime: {}};
-"""
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -133,42 +120,43 @@ def send_telegram(msg):
         log(f"Telegram failed: {e}")
 
 
-def send_telegram_photo(path, caption=""):
-    if not (BOT_TOKEN and CHAT_ID):
-        log("No Telegram credentials; skipping notification.")
-        return
-    try:
-        with open(path, "rb") as f:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                          data={"chat_id": CHAT_ID, "caption": caption[:1024]},
-                          files={"photo": f}, timeout=30)
-    except Exception as e:
-        log(f"Telegram photo failed: {e}")
-        send_telegram(caption)
-
-
 # -------------------------- State extraction ------------------------
-EXTRACT_JS = """
-() => {
-  const S = window.__INITIAL_STATE__;
-  if (!S) return null;
-  for (const slice of Object.keys(S)) {
-    const v = S[slice];
-    const q = v && v.queries;
-    if (!q) continue;
-    const key = Object.keys(q).find(k => k.toLowerCase().includes('showtimesbyvenue'));
-    if (!key) continue;
-    const data = (q[key] || {}).data || {};
-    if (!data.ShowDatesArray && !data.showDetailsTransformed) continue;
-    return {
-      servedDate: key.split('-').pop(),
-      showDates: data.ShowDatesArray || [],
-      events: (data.showDetailsTransformed || {}).Event || []
-    };
-  }
-  return null;
-}
-"""
+STATE_RE = re.compile(r"window\.__INITIAL_STATE__\s*=\s*")
+
+
+def extract_state(html):
+    """
+    Pull the showtimes slice out of the inline __INITIAL_STATE__ blob.
+    Mirrors the old in-page JS: find the queries slice whose key mentions
+    showtimesByVenue, and read its data.
+    """
+    m = STATE_RE.search(html)
+    if not m:
+        return None
+    try:
+        root, _ = json.JSONDecoder().raw_decode(html[m.end():])
+    except ValueError:
+        return None
+
+    for slice_value in root.values():
+        if not isinstance(slice_value, dict):
+            continue
+        queries = slice_value.get("queries")
+        if not isinstance(queries, dict):
+            continue
+        key = next((k for k in queries
+                    if "showtimesbyvenue" in k.lower()), None)
+        if not key:
+            continue
+        data = (queries.get(key) or {}).get("data") or {}
+        if "ShowDatesArray" not in data and "showDetailsTransformed" not in data:
+            continue
+        return {
+            "servedDate": key.split("-")[-1],
+            "showDates": data.get("ShowDatesArray") or [],
+            "events": (data.get("showDetailsTransformed") or {}).get("Event") or [],
+        }
+    return None
 
 
 def date_is_open(show_dates, target):
@@ -221,116 +209,82 @@ def format_shows(hits):
 # ---------------------------- One target ----------------------------
 def check_target(venue, date_code):
     """
-    Fresh browser, ONE navigation, extract, optionally screenshot, close.
-    Returns 'hit', 'partial', 'none', or 'blind'.
+    Fetch the page HTML with a real-Chrome TLS fingerprint, parse the inline
+    state, alert if wanted. Returns 'hit', 'partial', 'none', or 'blind'.
     """
     url = url_for(venue, date_code)
     tag = f"{venue['code']}-{date_code}"
     fmt_label = "/".join(f.upper() for f in venue["formats"])
     log(f"{venue['name']} | {pretty_date(date_code)} | need {fmt_label}")
 
+    state = None
+    html = ""
     for attempt in range(1, ATTEMPTS_PER_TARGET + 1):
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=LAUNCH_ARGS)
-            try:
-                ctx = browser.new_context(
-                    user_agent=UA, viewport={"width": 1280, "height": 900},
-                    locale="en-IN", timezone_id="Asia/Kolkata",
-                    extra_http_headers=HEADERS)
-                ctx.add_init_script(STEALTH_JS)
-                page = ctx.new_page()
+        profile = IMPERSONATE[(attempt - 1) % len(IMPERSONATE)]
+        try:
+            resp = curl_requests.get(url, impersonate=profile,
+                                     headers=HEADERS, timeout=30)
+            html = resp.text
+            state = extract_state(html)
+            if state:
+                break
+            title = re.search(r"<title>([^<]*)", html)
+            log(f"  attempt {attempt} ({profile}): status={resp.status_code} "
+                f"title={(title.group(1)[:40] if title else '')!r} — no state")
+        except Exception as e:
+            log(f"  attempt {attempt} ({profile}) error: {e}")
 
-                # The one and only navigation in this session.
-                resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                status = resp.status if resp else 0
+        if attempt < ATTEMPTS_PER_TARGET:
+            time.sleep(random.uniform(3, 6))
 
-                state = None
-                for _ in range(20):
-                    state = page.evaluate(EXTRACT_JS)
-                    if state:
-                        break
-                    page.wait_for_timeout(500)
+    if not state:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        try:
+            with open(os.path.join(OUT_DIR, f"blind-{tag}.html"),
+                      "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception:
+            pass
+        return "blind"
 
-                if not state:
-                    log(f"  attempt {attempt}: status={status} "
-                        f"title={page.title()[:40]!r} — no state")
-                    if attempt == ATTEMPTS_PER_TARGET:
-                        os.makedirs(OUT_DIR, exist_ok=True)
-                        try:
-                            with open(os.path.join(OUT_DIR, f"blind-{tag}.html"),
-                                      "w", encoding="utf-8") as f:
-                                f.write(page.content())
-                            page.screenshot(path=os.path.join(OUT_DIR, f"blind-{tag}.png"),
-                                            full_page=True)
-                        except Exception:
-                            pass
-                        return "blind"
-                    time.sleep(random.uniform(5, 10))
-                    continue
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(os.path.join(OUT_DIR, f"state-{tag}.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(state, f, indent=1)
 
-                # --- we have state ---
-                os.makedirs(OUT_DIR, exist_ok=True)
-                with open(os.path.join(OUT_DIR, f"state-{tag}.json"), "w",
-                          encoding="utf-8") as f:
-                    json.dump(state, f, indent=1)
+    served = state["servedDate"]
+    opened = date_is_open(state["showDates"], date_code)
 
-                served = state["servedDate"]
-                opened = date_is_open(state["showDates"], date_code)
+    # BMS redirects an unopened date to today, so the URL proves nothing.
+    if served != date_code or opened is False:
+        log(f"  date not open yet (served={served}, open={opened})")
+        return "none"
 
-                # BMS redirects an unopened date to today, so the URL proves nothing.
-                if served != date_code or opened is False:
-                    log(f"  date not open yet (served={served}, open={opened})")
-                    return "none"
+    fmt_keys = None if IGNORE_FORMAT else venue["formats"]
+    hits = find_shows(state["events"], fmt_keys)
+    any_fmt = find_shows(state["events"], None)
+    log(f"  served={served} matching={len(hits)} any-format={len(any_fmt)}")
 
-                fmt_keys = None if IGNORE_FORMAT else venue["formats"]
-                hits = find_shows(state["events"], fmt_keys)
-                any_fmt = find_shows(state["events"], None)
-                log(f"  served={served} matching={len(hits)} any-format={len(any_fmt)}")
+    header = f"{venue['name']} — {pretty_date(date_code)}"
+    if hits:
+        msg = (f"\U0001F3AC THE PARADISE ({fmt_label}) is LIVE!\n{header}\n"
+               f"{format_shows(hits)}\n{url}\n"
+               f"(Disable the cron job once you've booked.)")
+        result = "hit"
+    elif any_fmt and ALERT_ON_WRONG_FORMAT:
+        msg = (f"⚠️ The Paradise is listed at {header}, but NOT "
+               f"in {fmt_label} yet:\n{format_shows(any_fmt)}\n{url}")
+        result = "partial"
+    else:
+        log("  not listed yet")
+        return "none"
 
-                header = f"{venue['name']} — {pretty_date(date_code)}"
-                if hits:
-                    msg = (f"\U0001F3AC THE PARADISE ({fmt_label}) is LIVE!\n{header}\n"
-                           f"{format_shows(hits)}\n{url}\n"
-                           f"(Disable the cron job once you've booked.)")
-                    result = "hit"
-                elif any_fmt and ALERT_ON_WRONG_FORMAT:
-                    msg = (f"\u26A0\uFE0F The Paradise is listed at {header}, but NOT "
-                           f"in {fmt_label} yet:\n{format_shows(any_fmt)}\n{url}")
-                    result = "partial"
-                else:
-                    log("  not listed yet")
-                    return "none"
-
-                # Scrolling is not navigation, so it's safe in this session.
-                try:
-                    for _ in range(12):
-                        page.mouse.wheel(0, 900)
-                        page.wait_for_timeout(250)
-                    page.evaluate("window.scrollTo(0, 0)")
-                    page.wait_for_timeout(500)
-                except Exception as e:
-                    log(f"  scroll failed (screenshot may be partial): {e}")
-
-                shot = os.path.join(OUT_DIR, f"hit-{tag}.png")
-                page.screenshot(path=shot, full_page=True)
-                with open(os.path.join(OUT_DIR, f"hit-{tag}.html"), "w",
-                          encoding="utf-8") as f:
-                    f.write(page.content())
-                send_telegram_photo(shot, caption=msg)
-                log(f"  ALERT SENT ({result})")
-                return result
-
-            except Exception as e:
-                log(f"  attempt {attempt} error: {e}")
-                if attempt == ATTEMPTS_PER_TARGET:
-                    return "blind"
-                time.sleep(random.uniform(5, 10))
-            finally:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-    return "blind"
+    with open(os.path.join(OUT_DIR, f"hit-{tag}.html"), "w",
+              encoding="utf-8") as f:
+        f.write(html)
+    send_telegram(msg)
+    log(f"  ALERT SENT ({result})")
+    return result
 
 
 # --------------------------------- Main -----------------------------
